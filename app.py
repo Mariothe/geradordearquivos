@@ -3,96 +3,106 @@ import pdfplumber
 import pandas as pd
 import re
 import io
-import pytesseract
-from pdf2image import convert_from_bytes
+import os
+import zipfile
+from decimal import Decimal
 
-ID_ESTRUTURA = "R6GP3ZA"
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import mm
+
+# =========================================================
+# CONFIGURAÇÃO
+# =========================================================
+
 ANO_REF = "2025"
 ANO_CAL = "2024"
+CNPJ_FONTE = "06104166000134"
+NOME_FONTE = "FUNPREVCAP"
+ID_ESTRUTURA = "R6GP3ZA"
 
-# --------------------------------------------------
-# FUNÇÕES DE LIMPEZA
-# --------------------------------------------------
+# =========================================================
+# FUNÇÕES AUXILIARES
+# =========================================================
 
-def limpar_valor(texto):
-    if not texto:
+def normalizar_valor(valor_str):
+    """
+    Converte valores brasileiros:
+    1.384,00 -> 138400 (centavos)
+    """
+    if not valor_str:
         return 0
-    return int(re.sub(r"\D", "", texto))
 
+    valor_str = valor_str.strip()
+    valor_str = valor_str.replace(".", "").replace(",", ".")
+    try:
+        valor = Decimal(valor_str)
+        return int(valor * 100)
+    except:
+        return 0
 
-# --------------------------------------------------
-# EXTRAÇÃO TEXTO PDF
-# --------------------------------------------------
 
 def extrair_texto(pdf_bytes):
-    texto = ""
-
+    texto_total = ""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             t = page.extract_text()
-            if t and len(t) > 40:
-                texto += t + "\n"
-            else:
-                imagens = convert_from_bytes(pdf_bytes,
-                                              first_page=page.page_number,
-                                              last_page=page.page_number)
-                for img in imagens:
-                    texto += pytesseract.image_to_string(img, lang="por") + "\n"
-    return texto
+            if t:
+                texto_total += t + "\n"
+    return texto_total
 
-
-# --------------------------------------------------
-# EXTRAÇÃO DE DADOS
-# --------------------------------------------------
 
 def extrair_mes(texto):
     m = re.search(r"M[eê]s/Ano\s+(\d{2})/(\d{4})", texto)
     return int(m.group(1)) if m else None
 
 
-def extrair_blocos(texto):
-    blocos = re.split(r"CPF[:\s]*(\d{11})", texto)
-    resultado = []
-    for i in range(1, len(blocos)-1, 2):
-        resultado.append((blocos[i], blocos[i+1]))
-    return resultado
+def extrair_blocos_por_cpf(texto):
+    partes = re.split(r"CPF[:\s]*(\d{11})", texto)
+    blocos = []
+    for i in range(1, len(partes)-1, 2):
+        blocos.append((partes[i], partes[i+1]))
+    return blocos
 
 
 def extrair_valores(contexto):
 
-    base = re.search(r"(?:Base\s*Prev\.?|Proventos)[\s\r\n]+([\d\.,]+)", contexto, re.I)
-    irrf = re.search(r"IRRF.*?([\d\.,]+)$", contexto, re.M)
-    prev = re.search(r"PREVID[ÊE]NCIA.*?([\d\.,]+)$", contexto, re.M)
-    decimo = re.search(r"13", contexto)
+    base = re.search(r"Proventos\s+([\d\.,]+)", contexto)
+    irrf = re.search(r"IRRF.*?([\d\.,]+)", contexto)
+    prev = re.search(r"PREVID[ÊE]NCIA.*?([\d\.,]+)", contexto)
 
     return {
-        "base": limpar_valor(base.group(1)) if base else 0,
-        "irrf": limpar_valor(irrf.group(1)) if irrf else 0,
-        "prev": limpar_valor(prev.group(1)) if prev else 0,
-        "decimo": True if decimo else False
+        "base": normalizar_valor(base.group(1)) if base else 0,
+        "irrf": normalizar_valor(irrf.group(1)) if irrf else 0,
+        "prev": normalizar_valor(prev.group(1)) if prev else 0
     }
 
 
-def extrair_dados(arquivos):
+# =========================================================
+# CONSOLIDAÇÃO
+# =========================================================
+
+def processar_pdfs(arquivos):
 
     dados = []
 
-    for arq in arquivos:
-        texto = extrair_texto(arq.read())
+    for arquivo in arquivos:
+        texto = extrair_texto(arquivo.read())
         mes = extrair_mes(texto)
         if not mes:
             continue
 
-        for cpf, ctx in extrair_blocos(texto):
-            valores = extrair_valores(ctx)
+        blocos = extrair_blocos_por_cpf(texto)
+
+        for cpf, contexto in blocos:
+            valores = extrair_valores(contexto)
 
             dados.append({
                 "cpf": cpf,
                 "mes": mes,
                 "base": valores["base"],
                 "irrf": valores["irrf"],
-                "prev": valores["prev"],
-                "decimo": valores["decimo"]
+                "prev": valores["prev"]
             })
 
     df = pd.DataFrame(dados)
@@ -103,17 +113,17 @@ def extrair_dados(arquivos):
     return df
 
 
-# --------------------------------------------------
-# GERAÇÃO DIRF COMPATÍVEL COM PGD
-# --------------------------------------------------
+# =========================================================
+# GERAÇÃO DIRF
+# =========================================================
 
-def gerar_dirf(df, responsavel, cnpj, nome):
+def gerar_dirf(df, responsavel):
 
     linhas = []
 
     linhas.append(f"Dirf|{ANO_REF}|{ANO_CAL}|N||{ID_ESTRUTURA}|")
     linhas.append(f"RESPO|{responsavel['cpf']}|{responsavel['nome']}|{responsavel['ddd']}|{responsavel['tel']}||||")
-    linhas.append(f"DECPJ|{cnpj}|{nome}|1|{responsavel['cpf']}|N|N|N|N|N|N|N|N||")
+    linhas.append(f"DECPJ|{CNPJ_FONTE}|{NOME_FONTE}|1|{responsavel['cpf']}|N|N|N|N|N|N|N|N||")
     linhas.append("IDREC|0561|")
 
     for cpf, grupo in df.groupby("cpf"):
@@ -123,7 +133,6 @@ def gerar_dirf(df, responsavel, cnpj, nome):
         rend = [""]*13
         irrf = [""]*13
         prev = [""]*13
-        dec13 = ""
 
         for _, r in grupo.iterrows():
             idx = r["mes"]-1
@@ -131,49 +140,106 @@ def gerar_dirf(df, responsavel, cnpj, nome):
             irrf[idx] = str(r["irrf"])
             prev[idx] = str(r["prev"])
 
-            if r["decimo"]:
-                dec13 = str(r["base"])
-
         linhas.append(f"RTRT|{'|'.join(rend)}|")
         linhas.append(f"RTIRF|{'|'.join(irrf)}|")
         linhas.append(f"RTPS|{'|'.join(prev)}|")
-
-        if dec13:
-            linhas.append(f"RT13|{dec13}|")
 
     linhas.append("FIMDirf|")
 
     return "\n".join(linhas)
 
 
-# --------------------------------------------------
-# INTERFACE
-# --------------------------------------------------
+# =========================================================
+# INFORMES PDF
+# =========================================================
+
+def gerar_informes(df):
+
+    pasta = "informes_temp"
+    os.makedirs(pasta, exist_ok=True)
+    styles = getSampleStyleSheet()
+    arquivos = []
+
+    for cpf, grupo in df.groupby("cpf"):
+
+        total_base = grupo["base"].sum() / 100
+        total_irrf = grupo["irrf"].sum() / 100
+        total_prev = grupo["prev"].sum() / 100
+
+        caminho = f"{pasta}/Informe_{cpf}.pdf"
+
+        doc = SimpleDocTemplate(caminho, topMargin=20*mm)
+        elementos = []
+
+        elementos.append(Paragraph("<b>INFORME DE RENDIMENTOS</b>", styles["Heading2"]))
+        elementos.append(Spacer(1,12))
+
+        elementos.append(Paragraph(f"<b>Fonte Pagadora:</b> {NOME_FONTE}", styles["Normal"]))
+        elementos.append(Paragraph(f"<b>CNPJ:</b> {CNPJ_FONTE}", styles["Normal"]))
+        elementos.append(Spacer(1,12))
+
+        elementos.append(Paragraph(f"<b>CPF:</b> {cpf}", styles["Normal"]))
+        elementos.append(Spacer(1,12))
+
+        elementos.append(Paragraph(f"Rendimentos Tributáveis: R$ {total_base:,.2f}", styles["Normal"]))
+        elementos.append(Paragraph(f"Previdência Oficial: R$ {total_prev:,.2f}", styles["Normal"]))
+        elementos.append(Paragraph(f"IRRF Retido: R$ {total_irrf:,.2f}", styles["Normal"]))
+
+        doc.build(elementos)
+        arquivos.append(caminho)
+
+    zip_path = "Informes_Rendimentos.zip"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        for arq in arquivos:
+            zipf.write(arq, os.path.basename(arq))
+
+    return zip_path
+
+
+# =========================================================
+# INTERFACE STREAMLIT
+# =========================================================
 
 st.set_page_config(layout="wide")
-st.title("Consolidador DIRF e Informes de Rendimentos")
+st.title("Sistema DIRF + Informes de Rendimentos")
 
 with st.sidebar:
-    nome = st.text_input("Responsável", "MARIO FLAVIO PEREIRA")
-    cpf = st.text_input("CPF", "84598000325")
+    nome_resp = st.text_input("Responsável", "MARIO FLAVIO PEREIRA")
+    cpf_resp = st.text_input("CPF", "84598000325")
     ddd = st.text_input("DDD", "86")
     tel = st.text_input("Telefone", "32116868")
 
 arquivos = st.file_uploader("Envie os PDFs mensais", type="pdf", accept_multiple_files=True)
 
-if arquivos and st.button("Gerar DIRF"):
-    df = extrair_dados(arquivos)
+if arquivos and st.button("Processar Arquivos"):
+
+    df = processar_pdfs(arquivos)
 
     if df.empty:
         st.error("Nenhum dado encontrado.")
     else:
+        st.success("Dados extraídos com sucesso.")
         st.dataframe(df)
 
-        txt = gerar_dirf(
-            df,
-            {"nome":nome,"cpf":cpf,"ddd":ddd,"tel":tel},
-            "06104166000134",
-            "FUNPREVCAP"
+        responsavel = {
+            "nome": nome_resp,
+            "cpf": cpf_resp,
+            "ddd": ddd,
+            "tel": tel
+        }
+
+        dirf_txt = gerar_dirf(df, responsavel)
+
+        st.download_button(
+            "Baixar Arquivo DIRF",
+            dirf_txt.encode("latin-1"),
+            "DIRF.txt"
         )
 
-        st.download_button("Baixar Arquivo DIRF", txt.encode("latin-1"), "DIRF.txt")
+        zip_path = gerar_informes(df)
+
+        st.download_button(
+            "Baixar Informes de Rendimentos (PDF)",
+            open(zip_path, "rb"),
+            "Informes_Rendimentos.zip"
+        )
