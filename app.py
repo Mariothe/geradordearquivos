@@ -4,120 +4,113 @@ import re
 import io
 import pandas as pd
 
-# Configurações de Leiaute Oficial conforme Anexo Único [cite: 210]
+# Parâmetros Obrigatórios - Registro 3.1 [cite: 295]
 ID_ESTRUTURA = "R6GP3ZA" 
 ANO_REF = "2025"
 ANO_CAL = "2024"
 
-def processar_valor_estrito(texto_valor):
+def formatar_valor_tecnico(texto):
     """
-    Tratamento técnico: Converte 'R$ 1.384,00' em '138400'.
-    Remove todos os caracteres não numéricos e preserva a integridade posicional.
+    Regra 4: Campos numéricos de valores com 2 decimais.
+    Remove pontos de milhar e símbolos, tratando os últimos 2 dígitos como centavos.
     """
-    if not texto_valor: return "0"
-    
-    # Extrai apenas os dígitos para evitar confusão com separadores de milhar 
-    numeros = re.sub(r'\D', '', texto_valor)
-    
-    # Garante que o valor retornado seja o número inteiro de centavos
-    return numeros if numeros else "0"
+    if not texto: return "0"
+    # Mantém apenas dígitos e a última vírgula se existir
+    limpo = re.sub(r'[^\d,]', '', texto)
+    if ',' in limpo:
+        partes = limpo.split(',')
+        # Une a parte inteira com os 2 primeiros dígitos decimais
+        return f"{partes[0]}{partes[1].ljust(2, '0')[:2]}"
+    return limpo + "00"
 
-def extrair_dados_pdf(pdf_bytes):
-    dados_mes = []
+def extrair_dados_universal(pdf_bytes):
+    all_data = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        # Consolida texto preservando quebras de linha para identificação de blocos
-        texto_completo = ""
-        for page in pdf.pages:
-            texto_completo += page.extract_text() + "\n"
+        texto_completo = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
         
-        # Identifica Mês de Referência (ex: 03/2025) 
-        match_data = re.search(r"(\d{2})/(\d{4})", texto_completo)
-        mes_ref = int(match_data.group(1)) if match_data else 3
+        # Identifica Mês/Ano (Ex: 08/2025 ou 03/2025) [cite: 9, 61]
+        data_match = re.search(r"(\d{2})/(\d{4})", texto_completo)
+        mes_ref = int(data_match.group(1)) if data_match else 1
         
-        # Lógica de Captura por Proximidade Contextual
-        # Padrão: Nome (Linha anterior) -> CPF (Âncora) -> Valor (Após Proventos)
-        pattern = r"([A-Z\s]{10,})\s+(\d{3}\.\d{3}\.\d{3}-\d{2}).*?TOTAL DE PROVENTOS\s+R\$\s+([\d\.,]+)"
-        
-        for match in re.finditer(pattern, texto_completo, re.DOTALL):
-            nome_extraido = match.group(1).strip().split('\n')[-1] # Pega a última linha do bloco de nome
-            cpf_limpo = re.sub(r'\D', '', match.group(2)) # Regra 3: Sem máscaras 
-            valor_pgdc = processar_valor_estrito(match.group(3))
-            
-            dados_mes.append({
-                'nome': nome_extraido[:60].upper(), # Regra 3.2: Tamanho 60 [cite: 218]
-                'cpf': cpf_limpo,
-                'mes': mes_ref,
-                'rendimento': valor_pgdc
-            })
-    return dados_mes
+        # Identifica o Declarante (CNPJ ou CPF) [cite: 5, 58]
+        cnpj_declarante = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", texto_completo)
+        nome_declarante = re.search(r"(?:INSTITUTO|JURIPREV|FUNPREVCAP).*?\n", texto_completo, re.I)
 
-def gerar_txt_final(df, d_resp, d_decl):
+        # Captura Beneficiários (Nome, CPF e Proventos) [cite: 8, 22, 68, 70, 80]
+        # Busca o CPF como âncora e o valor 'Proventos' ou 'Total de Proventos' próximo
+        blocos = re.split(r"(\d{3}\.\d{3}\.\d{3}-\d{2}|\d{11})", texto_completo)
+        
+        for i in range(1, len(blocos), 2):
+            cpf = re.sub(r'\D', '', blocos[i]) # Regra 3 
+            contexto = blocos[i+1]
+            
+            # Pega o nome que geralmente está antes do CPF
+            linhas_antes = blocos[i-1].split('\n')
+            nome = linhas_anteriores[-1].strip() if (linhas_anteriores := [l for l in linhas_antes if l.strip()]) else "NOME"
+
+            # Busca o valor na coluna 'Proventos' ou 'Total de Proventos' [cite: 17, 33, 79]
+            valor_match = re.search(r"(?:PROVENTOS|TOTAL DE PROVENTOS).*?R\$\s*([\d\.,]+)", contexto, re.I)
+            if not valor_match: # Tenta busca apenas pelo valor monetário na linha de totais
+                valor_match = re.search(r"(\d{1,3}(?:\.\d{3})*,\d{2})", contexto)
+
+            if valor_match:
+                all_data.append({
+                    'nome': nome[:60].upper(), # Regra 3.2 [cite: 303]
+                    'cpf': cpf,
+                    'mes': mes_ref,
+                    'valor': formatar_valor_tecnico(valor_match.group(1))
+                })
+    return all_data, cnpj_declarante.group(0) if cnpj_declarante else "", nome_declarante.group(0).strip() if nome_declarante else ""
+
+def gerar_arquivo_dirf(df, d_resp, d_decl):
     linhas = []
-    # 3.1 Identificador Dirf [cite: 210]
+    # 1. Registro Dirf (Obrigatório, Ordem 1) [cite: 290, 293]
     linhas.append(f"Dirf|{ANO_REF}|{ANO_CAL}|N||{ID_ESTRUTURA}|")
     
-    # 3.2 Responsável (RESPO) [cite: 217, 218]
-    cpf_r = re.sub(r'\D', '', d_resp['cpf'])
-    linhas.append(f"RESPO|{cpf_r}|{d_resp['nome'].upper()}|{d_resp['ddd']}|{d_resp['tel']}||||")
+    # 2. Registro RESPO (Obrigatório, Ordem 2) [cite: 297, 300]
+    linhas.append(f"RESPO|{re.sub(r'\D', '', d_resp['cpf'])}|{d_resp['nome'].upper()}|{d_resp['ddd']}|{d_resp['tel']}||||")
     
-    # 3.4 Declarante PJ (DECPJ) [cite: 235]
-    cnpj_d = re.sub(r'\D', '', d_decl['cnpj'])
-    linhas.append(f"DECPJ|{cnpj_d}|{d_decl['nome'].upper()}|1|{cpf_r}|N|N|N|N|N|N|N|N||")
+    # 3. Registro DECPJ (Obrigatório, Ordem 3) [cite: 314, 317]
+    linhas.append(f"DECPJ|{re.sub(r'\D', '', d_decl['cnpj'])}|{d_decl['nome'].upper()}|1|{re.sub(r'\D', '', d_resp['cpf'])}|N|N|N|N|N|N|N|N||")
     
-    # Código de Receita Assalariado [cite: 244]
+    # 4. Registro IDREC [cite: 325]
     linhas.append(f"IDREC|0561|")
 
-    # Consolidação por CPF [cite: 247]
     for cpf, group in df.groupby('cpf'):
-        nome = group['nome'].iloc[0]
-        # 3.6 Beneficiário (BPFDEC) [cite: 250]
-        linhas.append(f"BPFDEC|{cpf}|{nome}||N|N|")
+        # 5. Registro BPFDEC [cite: 330]
+        linhas.append(f"BPFDEC|{cpf}|{group['nome'].iloc[0]}||N|N|")
         
-        # 3.19 Valores Mensais (RTRT) [cite: 342, 394]
-        rend_meses = [""] * 13 
+        # 6. Registro RTRT (Valores Mensais) [cite: 427, 437]
+        meses = [""] * 13 # Jan a Dez + 13º 
         for _, row in group.iterrows():
-            idx = int(row['mes']) - 1
-            rend_meses[idx] = row['rendimento']
-            
-        # Regra 6: Delimitador Pipe ao final de cada campo 
-        linhas.append(f"RTRT|{'|'.join(rend_meses)}|")
+            meses[int(row['mes'])-1] = row['valor']
+        
+        # Regra 6: Delimitador Pipe ao final 
+        linhas.append(f"RTRT|{'|'.join(meses)}|")
 
-    linhas.append("FIMDirf|") # 3.36 Término [cite: 577]
+    # 7. Registro FIMDirf (Obrigatório, Último) [cite: 146, 657, 660]
+    linhas.append("FIMDirf|")
     return "\n".join(linhas)
 
 # Interface Streamlit
-st.set_page_config(page_title="JURIPREV - Precisão PGD-C", layout="wide")
-st.title("⚖️ Gerador PGD-C: JURIPREV TECNOLOGIAS")
+st.title("🚀 Gerador Universal PGD-C")
+st.sidebar.header("Dados do Responsável (RESPO)")
+r_nome = st.sidebar.text_input("Nome Responsável")
+r_cpf = st.sidebar.text_input("CPF Responsável")
+r_ddd = st.sidebar.text_input("DDD (ex: 86)")
+r_tel = st.sidebar.text_input("Telefone")
 
-with st.sidebar:
-    st.header("👤 Dados do Responsável")
-    r_nome = st.text_input("Nome Completo", "MARIO FLAVIO PEREIRA")
-    r_cpf = st.text_input("CPF", "84598000325")
-    r_ddd = st.text_input("DDD", "86")
-    r_tel = st.text_input("Telefone", "32116868")
+uploaded_file = st.file_uploader("Arraste o PDF de qualquer entidade", type="pdf")
 
-uploaded_files = st.file_uploader("Suba os PDFs da JURIPREV", type="pdf", accept_multiple_files=True)
-
-if st.button("🚀 GERAR ARQUIVO COM PRECISÃO TOTAL", type="primary"):
-    if uploaded_files:
-        all_data = []
-        for f in uploaded_files:
-            all_data.extend(extrair_dados_pdf(f.read()))
+if uploaded_file and r_nome:
+    dados, cnpj_doc, nome_doc = extrair_dados_universal(uploaded_file.read())
+    if dados:
+        df = pd.DataFrame(dados)
+        st.subheader("✅ Conferência de Dados Extraídos")
+        st.table(df) # Exibe para conferência antes de gerar o TXT
         
-        if all_data:
-            df = pd.DataFrame(all_data)
-            st.subheader("✅ Verificação de Valores (Conferência Estrita)")
-            
-            # Formatação para conferência humana
-            df_check = df.copy()
-            df_check['Valor Final (PGD-C)'] = df_check['rendimento']
-            df_check['Valor Real (R$)'] = df_check['rendimento'].apply(
-                lambda x: f"R$ {int(x[:-2]) if len(x) > 2 else 0},{x[-2:].zfill(2)}"
-            )
-            st.table(df_check[['nome', 'cpf', 'Valor Real (R$)', 'Valor Final (PGD-C)']])
-            
-            d_decl = {"cnpj": "25316695000146", "nome": "JURIPREV TECNOLOGIAS"}
-            d_resp = {"nome": r_nome, "cpf": r_cpf, "ddd": r_ddd, "tel": r_tel}
-            
-            txt_content = gerar_txt_final(df, d_resp, d_decl)
-            st.download_button("📥 Baixar Arquivo TXT Validado", txt_content.encode('latin-1'), "DIRF_PRECISAO.txt")
+        d_decl = {"cnpj": cnpj_doc or "00000000000000", "nome": nome_doc or "DECLARANTE NAO ENCONTRADO"}
+        d_resp = {"nome": r_nome, "cpf": r_cpf, "ddd": r_ddd, "tel": r_tel}
+        
+        txt_final = gerar_arquivo_dirf(df, d_resp, d_decl)
+        st.download_button("📥 Baixar Arquivo para PGD-C", txt_final.encode('latin-1'), "DIRF_UNIVERSAL.txt")
