@@ -9,11 +9,28 @@ ID_ESTRUTURA = "R6GP3ZA"
 ANO_REF = "2025"
 ANO_CAL = "2024"
 
-def limpar_numero(texto):
-    """Remove máscaras de CPF e formata valores (Regra 3 e 4)"""
+   def limpar_numero(texto):
+    """
+    Garante a leitura correta de valores como R$ 1.384,00 para 138400.
+    Remove pontos de milhar, símbolos e trata a vírgula decimal.
+    """
     if not texto: return "0"
-    return re.sub(r'\D', '', str(texto))
-
+    
+    # Remove o símbolo R$ e espaços
+    texto = texto.replace('R$', '').strip()
+    
+    # Se o valor tem vírgula (ex: 1.384,00)
+    if ',' in texto:
+        # Remove o ponto (milhar) e depois a vírgula (decimal)
+        texto = texto.replace('.', '').replace(',', '')
+    else:
+        # Se for um número limpo, apenas remove caracteres não numéricos
+        texto = re.sub(r'\D', '', texto)
+        # Se o valor vier sem os dois zeros dos centavos, acrescenta-os
+        if len(texto) > 0 and len(texto) < 4:
+            texto = texto + "00"
+            
+    return texto
 def extrair_dados_ipmsf(pdf_bytes):
     """Extrai Nome, CPF e Valores do PDF do IPMSF"""
     beneficiarios = []
